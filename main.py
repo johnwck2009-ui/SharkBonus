@@ -1,77 +1,43 @@
+import asyncio
 import logging
 import os
-import random
+import re
 import sqlite3
+from io import BytesIO
 from pathlib import Path
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+
+import aiohttp
+from telegram import (
+    InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update,
+)
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
+    MessageHandler, filters,
 )
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("sharkbonus-ai")
 
 DB_PATH = Path(os.getenv("DATABASE_PATH", "sharkbonus.db"))
-QUESTIONS_PER_ROUND = 10
-POINTS_PER_CORRECT = 10
-ROUND_COMPLETION_BONUS = 20
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8048582254"))
+DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+GEMINI_IMAGE_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+MAX_HISTORY_MESSAGES = 12
 
-# A starter question bank. Add more questions here as the bot grows.
-QUESTIONS = [
-    {"category": "Football", "question": "Which country won the 2022 FIFA World Cup?",
-     "options": ["France", "Argentina", "Brazil", "Germany"], "answer": 1,
-     "explanation": "Argentina defeated France in the final."},
-    {"category": "Football", "question": "How many players does one football team have on the pitch at the start of a match?",
-     "options": ["9", "10", "11", "12"], "answer": 2,
-     "explanation": "A team starts with 11 players."},
-    {"category": "Movies", "question": "What is the name of the kingdom in Disney's Frozen?",
-     "options": ["Arendelle", "Narnia", "Genovia", "Corona"], "answer": 0,
-     "explanation": "Elsa and Anna are from Arendelle."},
-    {"category": "Music", "question": "How many strings does a standard guitar usually have?",
-     "options": ["4", "5", "6", "7"], "answer": 2,
-     "explanation": "A standard guitar usually has six strings."},
-    {"category": "General Knowledge", "question": "What is the capital city of Japan?",
-     "options": ["Seoul", "Tokyo", "Beijing", "Bangkok"], "answer": 1,
-     "explanation": "Tokyo is the capital of Japan."},
-    {"category": "Animals", "question": "What is the largest animal in the world?",
-     "options": ["African elephant", "Great white shark", "Blue whale", "Giraffe"], "answer": 2,
-     "explanation": "The blue whale is the largest known animal."},
-    {"category": "Technology", "question": "What does 'CPU' stand for?",
-     "options": ["Central Processing Unit", "Computer Power Utility", "Core Program Upload", "Central Program User"], "answer": 0,
-     "explanation": "CPU means Central Processing Unit."},
-    {"category": "Food", "question": "Which fruit is traditionally used to make guacamole?",
-     "options": ["Mango", "Avocado", "Pineapple", "Banana"], "answer": 1,
-     "explanation": "Avocado is the main ingredient in guacamole."},
-    {"category": "Geography", "question": "Which is the largest ocean on Earth?",
-     "options": ["Atlantic", "Indian", "Arctic", "Pacific"], "answer": 3,
-     "explanation": "The Pacific is the largest ocean."},
-    {"category": "Science", "question": "Which planet is known as the Red Planet?",
-     "options": ["Venus", "Mars", "Jupiter", "Mercury"], "answer": 1,
-     "explanation": "Mars appears reddish because of iron oxide on its surface."},
-    {"category": "Fun Facts", "question": "How many hearts does an octopus have?",
-     "options": ["One", "Two", "Three", "Four"], "answer": 2,
-     "explanation": "An octopus has three hearts."},
-    {"category": "Sports", "question": "How many rings are on the Olympic flag?",
-     "options": ["Four", "Five", "Six", "Seven"], "answer": 1,
-     "explanation": "The Olympic symbol has five interlocking rings."},
-    {"category": "Nature", "question": "What do bees collect from flowers to make honey?",
-     "options": ["Nectar", "Sap", "Dew", "Pollen only"], "answer": 0,
-     "explanation": "Bees collect nectar and transform it into honey."},
-    {"category": "Entertainment", "question": "Which instrument has black and white keys?",
-     "options": ["Drum", "Piano", "Trumpet", "Violin"], "answer": 1,
-     "explanation": "A piano has a keyboard of black and white keys."},
-]
 
 def db_connect():
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
     return connection
 
+
 def init_db():
     with db_connect() as db:
+        # Keep the existing users table compatible with databases from the trivia version.
         db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -82,8 +48,36 @@ def init_db():
                 correct_answers INTEGER NOT NULL DEFAULT 0
             )
         """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_history (
+                user_id INTEGER NOT NULL,
+                history TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (user_id)
+            )
+        """)
+        defaults = {
+            "promo_text": "✨ Explore our AI tools: get helpful answers and create images with AI.",
+            "promo_link": "",
+            "promo_image": "",
+            "reminders_enabled": "0",
+            "reminder_hours": "5",
+        }
+        for key, value in defaults.items():
+            db.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+
 
 def register_user(user):
+    if not user:
+        return
     with db_connect() as db:
         db.execute("""
             INSERT INTO users (user_id, username, first_name)
@@ -91,230 +85,430 @@ def register_user(user):
             ON CONFLICT(user_id) DO UPDATE SET
                 username=excluded.username,
                 first_name=excluded.first_name
-        """, (user.id, user.username or "", user.first_name or "Player"))
+        """, (user.id, user.username or "", user.first_name or "User"))
 
-def add_points(user_id, points, correct=False):
+
+def get_setting(key, default=""):
+    with db_connect() as db:
+        row = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
     with db_connect() as db:
         db.execute("""
-            UPDATE users
-            SET points = points + ?, correct_answers = correct_answers + ?
-            WHERE user_id = ?
-        """, (points, 1 if correct else 0, user_id))
+            INSERT INTO settings (key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, (key, str(value)))
 
-def finish_quiz(user_id):
+
+def get_all_user_ids():
     with db_connect() as db:
-        db.execute(
-            "UPDATE users SET quizzes_played = quizzes_played + 1 WHERE user_id = ?",
-            (user_id,),
+        rows = db.execute("SELECT user_id FROM users").fetchall()
+    return [row["user_id"] for row in rows]
+
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+
+def main_keyboard(provider="deepseek"):
+    provider_label = "DeepSeek" if provider == "deepseek" else "ChatGPT"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"🧠 {provider_label} (selected)", callback_data=f"provider:{provider}"
+            )
+        ],
+        [
+            InlineKeyboardButton("DeepSeek", callback_data="provider:deepseek"),
+            InlineKeyboardButton("ChatGPT", callback_data="provider:openai"),
+        ],
+        [InlineKeyboardButton("🖼 Make Image · NanoBanana", callback_data="mode:image")],
+        [InlineKeyboardButton("💬 Ask a Question", callback_data="mode:chat")],
+    ])
+
+
+def admin_keyboard():
+    enabled = get_setting("reminders_enabled", "0") == "1"
+    hours = get_setting("reminder_hours", "5")
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✏️ Change promo text", callback_data="admin:text"),
+            InlineKeyboardButton("🖼 Change image", callback_data="admin:image"),
+        ],
+        [InlineKeyboardButton("🔗 Change link", callback_data="admin:link")],
+        [InlineKeyboardButton("👁 Preview promotion", callback_data="admin:preview")],
+        [
+            InlineKeyboardButton(
+                "🔔 Reminders: ON" if enabled else "🔕 Reminders: OFF",
+                callback_data="admin:toggle",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "5 hours ✓" if hours == "5" else "5 hours",
+                callback_data="admin:hours:5",
+            ),
+            InlineKeyboardButton(
+                "10 hours ✓" if hours == "10" else "10 hours",
+                callback_data="admin:hours:10",
+            ),
+        ],
+    ])
+
+
+def promo_keyboard():
+    link = get_setting("promo_link", "").strip()
+    if link.startswith(("https://", "http://")):
+        return InlineKeyboardMarkup([[InlineKeyboardButton("✨ Explore Now", url=link)]])
+    return None
+
+
+async def send_promotion(bot, chat_id):
+    text = get_setting("promo_text", "").strip() or "Discover our AI assistant."
+    image_id = get_setting("promo_image", "").strip()
+    markup = promo_keyboard()
+    try:
+        if image_id:
+            await bot.send_photo(
+                chat_id=chat_id, photo=image_id, caption=text[:1024],
+                reply_markup=markup,
+            )
+        else:
+            await bot.send_message(chat_id=chat_id, text=text[:4096], reply_markup=markup)
+        return True
+    except Exception as exc:
+        logger.warning("Could not send promotion to %s: %s", chat_id, exc)
+        return False
+
+
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    user_ids = get_all_user_ids()
+    sent = 0
+    for user_id in user_ids:
+        if await send_promotion(context.bot, user_id):
+            sent += 1
+        await asyncio.sleep(0.04)
+    logger.info("Scheduled promotion sent to %s of %s users", sent, len(user_ids))
+
+
+def configure_reminders(app: Application):
+    for job in app.job_queue.get_jobs_by_name("promo-reminders"):
+        job.schedule_removal()
+    if get_setting("reminders_enabled", "0") == "1":
+        hours = int(get_setting("reminder_hours", "5"))
+        app.job_queue.run_repeating(
+            reminder_job,
+            interval=hours * 60 * 60,
+            first=hours * 60 * 60,
+            name="promo-reminders",
         )
 
-def get_user(user_id):
-    with db_connect() as db:
-        return db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
-
-def main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎮 Play Quiz", callback_data="play")],
-        [InlineKeyboardButton("🪙 My Points", callback_data="points"),
-         InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
-        [InlineKeyboardButton("ℹ️ About", callback_data="about")],
-    ])
-
-def quiz_keyboard(question_index, options):
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{label}. {option}", callback_data=f"answer:{question_index}:{i}")]
-        for i, (label, option) in enumerate(zip(("A", "B", "C", "D"), options))
-    ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    register_user(user)
-    text = (
-        "🦈 *WELCOME TO SHARKBONUS!*\n\n"
-        "Dive into random trivia, fun questions and exciting challenges!\n\n"
-        "🎮 Play quick quizzes\n"
-        "🪙 Earn Shark Points\n"
-        "🏆 See how you rank\n\n"
-        "Think you know it all? Let's find out!\n"
-        "👇 Tap below to get started."
+    register_user(update.effective_user)
+    context.user_data.setdefault("provider", "deepseek")
+    context.user_data["mode"] = "chat"
+    welcome = (
+        "👋 Welcome to your AI assistant!\n\n"
+        "🧠 *Explanations and answers*\n"
+        "Ask questions and get help using DeepSeek or ChatGPT.\n\n"
+        "🖼 *Visualize your ideas*\n"
+        "Describe an image and NanoBanana will create it for you.\n\n"
+        "Choose a tool below or simply send me a question."
     )
-    await update.message.reply_text(text, reply_markup=main_menu(), parse_mode="Markdown")
-
-async def show_points(query, user_id):
-    user = get_user(user_id)
-    await query.edit_message_text(
-        f"🪙 *Your Shark Points*\n\n"
-        f"Balance: *{user['points']:,} SP*\n"
-        f"Quizzes played: {user['quizzes_played']}\n"
-        f"Correct answers: {user['correct_answers']}",
-        reply_markup=main_menu(), parse_mode="Markdown",
+    await update.message.reply_text(
+        welcome, reply_markup=main_keyboard(context.user_data["provider"]),
+        parse_mode="Markdown",
     )
 
-async def show_leaderboard(query):
-    with db_connect() as db:
-        rows = db.execute(
-            "SELECT first_name, username, points FROM users "
-            "ORDER BY points DESC, first_name COLLATE NOCASE ASC LIMIT 10"
-        ).fetchall()
-    if not rows:
-        message = "🏆 No players yet. Be the first to play!"
-    else:
-        lines = ["🏆 *SHARKBONUS LEADERBOARD*", ""]
-        medals = ["🥇", "🥈", "🥉"]
-        for index, row in enumerate(rows):
-            name = f"@{row['username']}" if row["username"] else row["first_name"]
-            medal = medals[index] if index < 3 else f"{index + 1}."
-            lines.append(f"{medal} {name} — {row['points']:,} SP")
-        message = "\n".join(lines)
-    await query.edit_message_text(message, reply_markup=main_menu(), parse_mode="Markdown")
 
-async def begin_quiz(query, context, user_id):
-    if len(QUESTIONS) < QUESTIONS_PER_ROUND:
-        await query.edit_message_text("The question bank needs more questions. Please try again later.")
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("You are not authorized to use the admin panel.")
         return
-    selected = random.sample(QUESTIONS, QUESTIONS_PER_ROUND)
-    context.user_data["quiz"] = {"questions": selected, "index": 0, "score": 0}
-    await send_question(query, context)
-
-async def send_question(query, context):
-    quiz = context.user_data.get("quiz")
-    if not quiz:
-        await query.edit_message_text("No active quiz. Tap Play Quiz to start.", reply_markup=main_menu())
-        return
-    index = quiz["index"]
-    question = quiz["questions"][index]
-    text = (
-        f"🦈 *SHARKBONUS QUIZ*\n"
-        f"Question *{index + 1}/{QUESTIONS_PER_ROUND}*\n"
-        f"Category: _{question['category']}_\n\n"
-        f"*{question['question']}*"
-    )
-    await query.edit_message_text(
-        text, reply_markup=quiz_keyboard(index, question["options"]), parse_mode="Markdown"
+    await update.message.reply_text(
+        "⚙️ *AI BOT ADMIN PANEL*\nManage your promotional content and reminders below.",
+        reply_markup=admin_keyboard(), parse_mode="Markdown",
     )
 
-async def handle_answer(query, context, user_id, index, answer_index):
-    quiz = context.user_data.get("quiz")
-    if not quiz or index != quiz["index"]:
-        await query.answer("That question has already passed.", show_alert=True)
-        return
-    question = quiz["questions"][index]
-    if answer_index == question["answer"]:
-        quiz["score"] += POINTS_PER_CORRECT
-        add_points(user_id, POINTS_PER_CORRECT, correct=True)
-        feedback = f"✅ Correct! +{POINTS_PER_CORRECT} SP\n{question['explanation']}"
-    else:
-        correct_option = question["options"][question["answer"]]
-        feedback = f"❌ Not quite! The answer was *{correct_option}*.\n{question['explanation']}"
-    await query.answer("Answer recorded!")
-    quiz["index"] += 1
-    if quiz["index"] >= QUESTIONS_PER_ROUND:
-        bonus = ROUND_COMPLETION_BONUS
-        add_points(user_id, bonus)
-        finish_quiz(user_id)
-        total = quiz["score"] + bonus
-        context.user_data.pop("quiz", None)
-        user = get_user(user_id)
-        await query.edit_message_text(
-            f"{feedback}\n\n🎉 *ROUND COMPLETE!*\n"
-            f"Correct-answer points: {quiz['score']} SP\n"
-            f"Completion bonus: +{bonus} SP\n"
-            f"*Round total: {total} SP*\n\n"
-            f"Your balance: *{user['points']:,} SP*",
-            reply_markup=main_menu(), parse_mode="Markdown",
-        )
-    else:
-        next_q = quiz["questions"][quiz["index"]]
-        text = (
-            f"{feedback}\n\n"
-            f"🦈 *Question {quiz['index'] + 1}/{QUESTIONS_PER_ROUND}*\n"
-            f"Category: _{next_q['category']}_\n\n"
-            f"*{next_q['question']}*"
-        )
-        await query.edit_message_text(
-            text,
-            reply_markup=quiz_keyboard(quiz["index"], next_q["options"]),
-            parse_mode="Markdown",
-        )
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["history"] = []
+    context.user_data["mode"] = "chat"
+    await update.message.reply_text("Your conversation has been cleared. Send a new question anytime.")
+
+
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["mode"] = "image"
+    await update.message.reply_text(
+        "🖼 Send me a description of the image you want NanoBanana to create."
+    )
+
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await query.answer()
+    data = query.data or ""
     user_id = query.from_user.id
     register_user(query.from_user)
-    data = query.data or ""
-    if data == "play":
-        await query.answer()
-        await begin_quiz(query, context, user_id)
-    elif data == "points":
-        await query.answer()
-        await show_points(query, user_id)
-    elif data == "leaderboard":
-        await query.answer()
-        await show_leaderboard(query)
-    elif data == "about":
-        await query.answer()
+
+    if data.startswith("provider:"):
+        provider = data.split(":", 1)[1]
+        if provider not in ("deepseek", "openai"):
+            return
+        context.user_data["provider"] = provider
+        context.user_data["mode"] = "chat"
+        label = "DeepSeek" if provider == "deepseek" else "ChatGPT"
         await query.edit_message_text(
-            "🦈 *ABOUT SHARKBONUS*\n\n"
-            "SharkBonus is a casual trivia bot packed with questions about football, "
-            "movies, music, general knowledge, technology and more.\n\n"
-            "Play quick quizzes, collect virtual Shark Points and have fun! "
-            "Points are for entertainment only and have no cash value.",
-            reply_markup=main_menu(), parse_mode="Markdown",
+            f"✅ {label} selected. Send me your question.",
+            reply_markup=main_keyboard(provider),
         )
-    elif data.startswith("answer:"):
-        try:
-            _, index, answer_index = data.split(":")
-            await handle_answer(query, context, user_id, int(index), int(answer_index))
-        except (ValueError, IndexError):
-            await query.answer("Something went wrong. Please start a new quiz.", show_alert=True)
+        return
 
-async def quiz_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update.effective_user)
-    # Commands can start a quiz without a callback query.
-    selected = random.sample(QUESTIONS, QUESTIONS_PER_ROUND)
-    context.user_data["quiz"] = {"questions": selected, "index": 0, "score": 0}
-    quiz = context.user_data["quiz"]
-    q = quiz["questions"][0]
-    await update.message.reply_text(
-        f"🦈 *SHARKBONUS QUIZ*\nQuestion *1/{QUESTIONS_PER_ROUND}*\n"
-        f"Category: _{q['category']}_\n\n*{q['question']}*",
-        reply_markup=quiz_keyboard(0, q["options"]), parse_mode="Markdown",
+    if data == "mode:image":
+        context.user_data["mode"] = "image"
+        await query.message.reply_text(
+            "🖼 *NanoBanana image generator*\nDescribe the image you want me to create.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "mode:chat":
+        context.user_data["mode"] = "chat"
+        provider = context.user_data.get("provider", "deepseek")
+        await query.message.reply_text(
+            "💬 Chat mode is ready. Send me a question.",
+            reply_markup=main_keyboard(provider),
+        )
+        return
+
+    if data.startswith("admin:"):
+        if not is_admin(user_id):
+            await query.answer("Not authorized.", show_alert=True)
+            return
+        action = data.split(":")
+        if action[1] == "text":
+            context.user_data["admin_pending"] = "text"
+            await query.message.reply_text("Send the new promotional text.")
+        elif action[1] == "image":
+            context.user_data["admin_pending"] = "image"
+            await query.message.reply_text("Send the new promotional image as a photo.")
+        elif action[1] == "link":
+            context.user_data["admin_pending"] = "link"
+            await query.message.reply_text("Send the destination URL (https://...). Send /clearlink to remove it.")
+        elif action[1] == "preview":
+            await send_promotion(context.bot, user_id)
+        elif action[1] == "toggle":
+            enabled = get_setting("reminders_enabled", "0") != "1"
+            set_setting("reminders_enabled", "1" if enabled else "0")
+            configure_reminders(context.application)
+            await query.message.reply_text(
+                "Scheduled reminders are now " + ("ON." if enabled else "OFF."),
+                reply_markup=admin_keyboard(),
+            )
+        elif action[1] == "hours" and len(action) == 3 and action[2] in ("5", "10"):
+            set_setting("reminder_hours", action[2])
+            configure_reminders(context.application)
+            await query.message.reply_text(
+                f"Reminder interval set to every {action[2]} hours.",
+                reply_markup=admin_keyboard(),
+            )
+
+
+async def call_chat_api(provider, messages):
+    if provider == "deepseek":
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        endpoint = DEEPSEEK_URL
+        model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    else:
+        api_key = os.getenv("OPENAI_API_KEY")
+        endpoint = OPENAI_URL
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    if not api_key:
+        name = "DEEPSEEK_API_KEY" if provider == "deepseek" else "OPENAI_API_KEY"
+        return f"⚠️ This provider is not configured yet. Add {name} to your hosting environment variables."
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.7,
+    }
+    timeout = aiohttp.ClientTimeout(total=90)
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(endpoint, json=payload, headers=headers) as response:
+            data = await response.json(content_type=None)
+            if response.status >= 400:
+                logger.error("%s API error %s: %s", provider, response.status, data)
+                detail = data.get("error", {}).get("message", "The AI provider returned an error.")
+                return f"⚠️ {detail}"
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError):
+        logger.error("Unexpected %s response: %s", provider, data)
+        return "Sorry, I couldn't read the AI response. Please try again."
+
+
+async def generate_image(prompt):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return None, "⚠️ Image generation is not configured yet. Add GEMINI_API_KEY to your hosting environment variables."
+
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_IMAGE_MODEL}:generateContent?key={api_key}"
     )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseModalities": ["IMAGE"]},
+    }
+    timeout = aiohttp.ClientTimeout(total=180)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(endpoint, json=payload) as response:
+            data = await response.json(content_type=None)
+            if response.status >= 400:
+                logger.error("Gemini image error %s: %s", response.status, data)
+                detail = data.get("error", {}).get("message", "Image generation failed.")
+                return None, f"⚠️ {detail}"
+    for candidate in data.get("candidates", []):
+        for part in candidate.get("content", {}).get("parts", []):
+            inline = part.get("inlineData") or part.get("inline_data")
+            if inline and inline.get("data"):
+                import base64
+                raw = base64.b64decode(inline["data"])
+                mime = inline.get("mimeType") or inline.get("mime_type") or "image/png"
+                extension = "jpg" if "jpeg" in mime else "png"
+                return (raw, extension), None
+    return None, "The image provider did not return an image. Please try a different prompt."
 
-async def points_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update.effective_user)
-    user = get_user(update.effective_user.id)
-    await update.message.reply_text(
-        f"🪙 Your balance: *{user['points']:,} SP*",
-        reply_markup=main_menu(), parse_mode="Markdown",
+
+async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = context.user_data.get("admin_pending")
+    if not pending or not is_admin(update.effective_user.id):
+        return False
+
+    if pending == "text":
+        if not update.message.text:
+            await update.message.reply_text("Please send the promotional text as a text message.")
+            return True
+        set_setting("promo_text", update.message.text.strip())
+        context.user_data.pop("admin_pending", None)
+        await update.message.reply_text("✅ Promotional text updated.", reply_markup=admin_keyboard())
+        return True
+
+    if pending == "link":
+        if not update.message.text:
+            await update.message.reply_text("Please send a valid URL beginning with https:// or http://.")
+            return True
+        value = update.message.text.strip()
+        if value.lower() == "/clearlink":
+            set_setting("promo_link", "")
+        elif re.match(r"^https?://[^\s]+$", value):
+            set_setting("promo_link", value)
+        else:
+            await update.message.reply_text("That URL doesn't look valid. Send a link beginning with https:// or http://.")
+            return True
+        context.user_data.pop("admin_pending", None)
+        await update.message.reply_text("✅ Promotional link updated.", reply_markup=admin_keyboard())
+        return True
+
+    if pending == "image":
+        if not update.message.photo:
+            await update.message.reply_text("Please send the image as a Telegram photo.")
+            return True
+        set_setting("promo_image", update.message.photo[-1].file_id)
+        context.user_data.pop("admin_pending", None)
+        await update.message.reply_text("✅ Promotional image updated.", reply_markup=admin_keyboard())
+        return True
+
+    return False
+
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    register_user(user)
+
+    if await handle_admin_input(update, context):
+        return
+
+    if not update.message or not update.message.text:
+        return
+    prompt = update.message.text.strip()
+    if not prompt:
+        return
+
+    mode = context.user_data.get("mode", "chat")
+    if mode == "image":
+        status = await update.message.reply_text("🎨 Creating your image with NanoBanana. Please wait...")
+        result, error = await generate_image(prompt)
+        if error:
+            await status.edit_text(error)
+            return
+        raw, extension = result
+        await status.delete()
+        await update.message.reply_photo(
+            photo=InputFile(BytesIO(raw), filename=f"nanobanana.{extension}"),
+            caption="✨ Your AI-generated image is ready!",
+        )
+        return
+
+    provider = context.user_data.get("provider", "deepseek")
+    history = context.user_data.setdefault("history", [])
+    history.append({"role": "user", "content": prompt})
+    history = history[-MAX_HISTORY_MESSAGES:]
+    context.user_data["history"] = history
+    status = await update.message.reply_text(
+        "🧠 Thinking with " + ("DeepSeek" if provider == "deepseek" else "ChatGPT") + "..."
     )
+    answer = await call_chat_api(
+        provider,
+        [{"role": "system", "content": "You are a helpful, clear and friendly AI assistant."}] + history,
+    )
+    if not answer.startswith("⚠️"):
+        history.append({"role": "assistant", "content": answer})
+        context.user_data["history"] = history[-MAX_HISTORY_MESSAGES:]
+    await status.delete()
+    for offset in range(0, len(answer), 4000):
+        await update.message.reply_text(answer[offset:offset + 4000])
 
-async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    register_user(update.effective_user)
-    with db_connect() as db:
-        rows = db.execute(
-            "SELECT first_name, username, points FROM users "
-            "ORDER BY points DESC, first_name COLLATE NOCASE ASC LIMIT 10"
-        ).fetchall()
-    lines = ["🏆 *SHARKBONUS LEADERBOARD*", ""]
-    for i, row in enumerate(rows):
-        name = f"@{row['username']}" if row["username"] else row["first_name"]
-        lines.append(f"{i + 1}. {name} — {row['points']:,} SP")
-    await update.message.reply_text("\n".join(lines), reply_markup=main_menu(), parse_mode="Markdown")
+
+async def clear_link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    set_setting("promo_link", "")
+    context.user_data.pop("admin_pending", None)
+    await update.message.reply_text("Promotional link removed.", reply_markup=admin_keyboard())
+
+
+async def post_init(app: Application):
+    configure_reminders(app)
+
 
 def main():
     token = os.getenv("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN environment variable is required.")
     init_db()
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(post_init)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("quiz", quiz_command))
-    app.add_handler(CommandHandler("points", points_command))
-    app.add_handler(CommandHandler("leaderboard", leaderboard_command))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    logger.info("SharkBonus is starting...")
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("reset", reset_command))
+    app.add_handler(CommandHandler("imagine", image_command))
+    app.add_handler(CommandHandler("clearlink", clear_link_command))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, message_handler))
+    logger.info("SharkBonus AI assistant is starting...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()

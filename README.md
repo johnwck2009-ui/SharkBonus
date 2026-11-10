@@ -1,19 +1,61 @@
-# SharkBonus 🦈
+# SharkBonus AI Assistant 🤖
 
-A lightweight Telegram trivia bot with mixed-category quizzes and virtual Shark Points.
+SharkBonus is now an AI assistant on Telegram. It provides text answers through DeepSeek and ChatGPT, plus AI image generation through Google's Gemini image API (NanoBanana).
 
 ## Features
 
-- 10-question random quiz rounds
-- Mixed trivia: football, movies, music, general knowledge, animals, technology, food, geography and more
-- Four answer options per question with instant feedback
-- 10 Shark Points (SP) per correct answer
-- 20 SP bonus for completing a round
-- Personal points and quiz statistics
-- Top-10 leaderboard
-- SQLite storage for player scores
+- DeepSeek chat for explanations, answers and everyday questions
+- ChatGPT chat as an alternative AI provider
+- NanoBanana image generation from text prompts
+- Conversation context during a chat (use `/reset` to clear it)
+- Private admin panel for promotional content
+- Admin can update the promotional image, text and destination link
+- Optional scheduled promotions to registered users every 5 or 10 hours
+- SQLite storage for users and admin settings
 
-Points are virtual and have no cash or withdrawal value.
+## Required environment variables
+
+Set these in your hosting provider's environment settings. Never commit API keys or bot tokens to GitHub.
+
+| Variable | Purpose |
+|---|---|
+| `BOT_TOKEN` | Telegram bot token from @BotFather |
+| `DEEPSEEK_API_KEY` | DeepSeek API key |
+| `OPENAI_API_KEY` | OpenAI API key for ChatGPT |
+| `GEMINI_API_KEY` | Google AI API key for NanoBanana image generation |
+
+Optional settings:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ADMIN_ID` | `8048582254` | Telegram numeric ID allowed to use /admin |
+| `DEEPSEEK_MODEL` | `deepseek-chat` | DeepSeek chat model |
+| `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI chat model |
+| `GEMINI_IMAGE_MODEL` | `gemini-2.5-flash-image` | Gemini image model |
+| `DATABASE_PATH` | `sharkbonus.db` | SQLite database location |
+
+Each AI provider is independently configured. If a key is missing, that feature will explain which environment variable is needed.
+
+## Admin panel
+
+Send `/admin` from the authorized admin account.
+
+- Change promotional text
+- Upload a new promotional image
+- Change or clear the destination link
+- Preview the current promotion
+- Turn scheduled reminders on or off
+- Choose a 5-hour or 10-hour interval
+
+Reminders are disabled by default. When enabled, the bot sends the current promotion to users who have started the bot. Telegram users must start the bot before it can message them.
+
+## Commands
+
+- `/start` — open the AI assistant
+- `/admin` — open the admin panel (authorized admin only)
+- `/imagine` — switch to image generation mode
+- `/reset` — clear your current conversation context
+- `/clearlink` — clear the promotion link (admin only)
 
 ## Run locally
 
@@ -24,41 +66,15 @@ Points are virtual and have no cash or withdrawal value.
    pip install -r requirements.txt
    ```
 
-3. Create a Telegram bot with [@BotFather](https://t.me/BotFather) and copy its token.
-4. Set the environment variable `BOT_TOKEN`:
+3. Set the environment variables listed above.
+4. Run:
 
-   **macOS/Linux**
    ```bash
-   export BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
    python main.py
    ```
-
-   **Windows PowerShell**
-   ```powershell
-   $env:BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
-   python main.py
-   ```
-
-The database is created automatically at `sharkbonus.db`. Set `DATABASE_PATH` to change its location.
 
 ## Deploy on Render
 
-This repository includes a `render.yaml` blueprint for a background worker with a persistent disk.
+The repository includes a Render background-worker blueprint. Set `BOT_TOKEN`, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, and `GEMINI_API_KEY` as secret environment variables in Render, then deploy. The SQLite database uses the persistent disk configured in `render.yaml`.
 
-1. Push this repository to GitHub.
-2. In Render, create a new Blueprint and select this repository.
-3. Add your Telegram bot token as the secret environment variable `BOT_TOKEN`.
-4. Deploy the worker.
-
-Do not commit your bot token or database file to GitHub.
-
-## Commands
-
-- `/start` — open the main menu
-- `/quiz` — start a quiz
-- `/points` — check your points
-- `/leaderboard` — view the top players
-
-## Add questions
-
-Add question objects to the `QUESTIONS` list in `main.py`. The `answer` value is the zero-based index of the correct option (A=0, B=1, C=2, D=3).
+**Note:** NanoBanana generation uses the Gemini API. Ensure the configured Google AI account and selected image model have image-generation access.

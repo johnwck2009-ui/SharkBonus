@@ -130,8 +130,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     register_user(user)
     text = (
-        "🦈 *WELCOME TO SHARKBONUS!*
-\n"
+        "🦈 *WELCOME TO SHARKBONUS!*\n\n"
         "Dive into random trivia, fun questions and exciting challenges!\n\n"
         "🎮 Play quick quizzes\n"
         "🪙 Earn Shark Points\n"
